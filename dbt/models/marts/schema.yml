@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: stg_chicago_crimes_silver
+    description: Typed, standardized Silver crime incidents sourced from the PySpark Lakehouse.
+    columns:
+      - name: crime_id
+        tests:
+          - not_null
+          - unique
+      - name: crime_date
+        tests:
+          - not_null
+      - name: primary_type
+        tests:
+          - not_null
+
+  - name: mart_daily_citywide_crime_trends
+    description: Daily citywide crime incident, arrest, and 7-day rolling average metrics.
+    columns:
+      - name: crime_date
+        tests:
+          - not_null
+          - unique
+      - name: incident_count
+        tests:
+          - not_null
+
+  - name: mart_district_crime_summary
+    description: Police district aggregate volumes, arrest rates, and valid-coordinate coverage.
+    columns:
+      - name: district_id
+        tests:
+          - not_null
+          - unique
+      - name: incident_count
+        tests:
+          - not_null
+
+  - name: mart_category_arrest_profile
+    description: Primary offense category counts, citywide shares, and arrest percentages.
+    columns:
+      - name: primary_type
+        tests:
+          - not_null
+          - unique
+      - name: incident_count
+        tests:
+          - not_null

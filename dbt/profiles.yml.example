@@ -1,0 +1,13 @@
+# Copy to ~/.dbt/profiles.yml (or pass --profiles-dir) when running against a GCP BigQuery sandbox.
+chicago_crimes_bigquery:
+  target: dev
+  outputs:
+    dev:
+      type: bigquery
+      method: oauth
+      project: "{{ env_var('GCP_PROJECT_ID', 'chicago-crimes-sandbox') }}"
+      dataset: "{{ env_var('BIGQUERY_DATASET', 'chicago_crimes') }}"
+      location: "{{ env_var('BIGQUERY_LOCATION', 'US') }}"
+      threads: 4
+      timeout_seconds: 300
+      priority: interactive

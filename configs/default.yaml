@@ -1,0 +1,73 @@
+# Default configuration for Chicago Crime Analytics Platform
+
+spark:
+  app_name: ChicagoCrimesAnalytics
+  profile: local
+  master: "local[4]"
+  driver_host: "127.0.0.1"
+  driver_bind_address: "127.0.0.1"
+  driver_memory: "4g"
+  executor_memory: "2g"
+  executor_cores: 2
+  cores_max: 4
+  shuffle_partitions: 64
+  default_parallelism: 4
+  log_level: "WARN"
+  session_timezone: "UTC"
+  enable_adaptive_execution: true
+  enable_delta: false
+  enable_kafka: false
+
+storage:
+  backend: local
+  table_format: parquet
+  s3_endpoint: "http://localhost:9000"
+  s3_access_key: "minioadmin"
+  s3_secret_key: "minioadmin"
+  s3_bucket: "chicago-crimes"
+  s3_ssl_enabled: false
+
+paths:
+  raw_csv: "data/chicago_crimes.csv"
+  bronze_dir: "data/bronze/chicago_crimes"
+  silver_dir: "data/silver/chicago_crimes"
+  gold_dir: "data/gold"
+  quarantine_dir: "data/quarantine/chicago_crimes"
+  legacy_clean_dir: "data/processed/chicago_crimes_clean"
+  analytics_output_dir: "artifacts/analytics"
+  stats_output_dir: "artifacts/stats"
+  experiments_output_dir: "artifacts/experiments"
+  ml_output_dir: "artifacts/ml"
+
+analytics:
+  min_district_crimes: 1000
+  community_area_id: 40
+  arrest_share_year: 2025
+  min_fbi_cases: 100
+
+experiments:
+  seed: 42
+  pca_components: 10
+  pca_sample_fraction: 0.1
+  pca_sample_max_rows: 50000
+  famd_components: 6
+  famd_sample_fraction: 0.1
+  famd_sample_max_rows: 20000
+  sampling_pca_max_rows: 50000
+
+streaming:
+  soda_endpoint: "https://data.cityofchicago.org/resource/ijzp-q8t2.json"
+  soda_page_size: 1000
+  soda_overlap_seconds: 60
+  watermark_path: "artifacts/state/soda_watermark.json"
+  kafka_bootstrap_servers: "localhost:9094"
+  kafka_topic: "chicago-crimes.raw"
+  kafka_dlq_topic: "chicago-crimes.dlq"
+  starting_offsets: "earliest"
+  trigger_interval_seconds: 10
+  checkpoint_location: "artifacts/checkpoints/crime_stream"
+  bronze_stream_target: "data/streaming/bronze_crimes"
+  silver_stream_target: "data/streaming/silver_crimes"
+  quarantine_stream_target: "data/streaming/quarantine_crimes"
+  dlq_stream_target: "data/streaming/dlq_crimes"
+  metrics_log_path: "artifacts/streaming/microbatch_metrics.jsonl"

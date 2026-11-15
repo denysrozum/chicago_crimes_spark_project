@@ -1,0 +1,318 @@
+name: chicago-crimes-platform
+
+networks:
+  chicago-crimes-net:
+    driver: bridge
+
+volumes:
+  minio-data:
+  spark-logs:
+  kafka-data:
+  postgres-data:
+  airflow-logs:
+
+x-spark-common: &spark-common
+  build:
+    context: .
+    dockerfile: infrastructure/spark/Dockerfile
+  image: chicago-crimes-spark:0.2.0
+  networks:
+    - chicago-crimes-net
+  environment: &spark-env
+    CHICAGO_CRIMES_PROFILE: standalone
+    SPARK_MASTER_URL: spark://spark-master:7077
+    SPARK_MASTER_UI_URL: http://spark-master:8080
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+    MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    MINIO_BUCKET: ${MINIO_BUCKET:-chicago-crimes}
+    CHICAGO_CRIMES_STORAGE_BACKEND: s3a
+    CHICAGO_CRIMES_TABLE_FORMAT: delta
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_CRIME_TOPIC: ${KAFKA_CRIME_TOPIC:-chicago-crimes.raw}
+    KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC:-chicago-crimes.dlq}
+    SPARK_LOCAL_DIR: /tmp/chicago-crimes-spark
+  volumes:
+    - ./data:/app/data
+    - ./configs:/app/configs
+    - ./artifacts:/app/artifacts
+    - spark-logs:/tmp/spark-logs
+
+services:
+  minio:
+    # Public minio/minio Docker Hub tags were removed; Chainguard provides MinIO (RELEASE.2026-11-12T01-15-23Z).
+    image: cgr.dev/chainguard/minio:latest
+    container_name: chicago-crimes-minio
+    profiles: ["storage", "spark", "streaming", "orchestration"]
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio-data:/data
+    networks:
+      - chicago-crimes-net
+    restart: unless-stopped
+
+  minio-init:
+    <<: *spark-common
+    container_name: chicago-crimes-minio-init
+    profiles: ["storage", "spark", "streaming", "orchestration"]
+    environment:
+      <<: *spark-env
+      CHICAGO_CRIMES_SPARK_ROLE: minio-init
+    depends_on:
+      - minio
+    restart: "no"
+
+  spark-master:
+    <<: *spark-common
+    container_name: chicago-crimes-spark-master
+    hostname: spark-master
+    profiles: ["spark", "streaming", "orchestration"]
+    ports:
+      - "7077:7077"
+      - "8080:8080"
+    environment:
+      <<: *spark-env
+      CHICAGO_CRIMES_SPARK_ROLE: master
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import requests; r=requests.get('http://localhost:8080/json/', timeout=3); assert r.json()['status'] == 'ALIVE'",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  spark-worker-1:
+    <<: *spark-common
+    container_name: chicago-crimes-spark-worker-1
+    hostname: spark-worker-1
+    profiles: ["spark", "streaming", "orchestration"]
+    ports:
+      - "8081:8081"
+    environment:
+      <<: *spark-env
+      CHICAGO_CRIMES_SPARK_ROLE: worker
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "1800M"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import requests; r=requests.get('http://localhost:8081/json/', timeout=3); assert r.status_code == 200",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  spark-worker-2:
+    <<: *spark-common
+    container_name: chicago-crimes-spark-worker-2
+    hostname: spark-worker-2
+    profiles: ["spark", "streaming", "orchestration"]
+    ports:
+      - "8082:8081"
+    environment:
+      <<: *spark-env
+      CHICAGO_CRIMES_SPARK_ROLE: worker
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_MEMORY: "1800M"
+      SPARK_WORKER_WEBUI_PORT: "8081"
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import requests; r=requests.get('http://localhost:8081/json/', timeout=3); assert r.status_code == 200",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  spark-runner:
+    <<: *spark-common
+    profiles: ["tools", "spark", "streaming"]
+    environment:
+      <<: *spark-env
+      CHICAGO_CRIMES_SPARK_ROLE: runner
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+  kafka:
+    image: apache/kafka-native:3.8.1
+    container_name: chicago-crimes-kafka
+    hostname: kafka
+    profiles: ["streaming", "tools", "orchestration"]
+    ports:
+      - "9094:9094"
+    environment:
+      CLUSTER_ID: "5L6g3nShT-eMCtK--X86sw"
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_LISTENERS: "INTERNAL://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "INTERNAL://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: "0"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_DIRS: "/home/appuser/kafka-logs"
+    volumes:
+      - kafka-data:/home/appuser
+    networks:
+      - chicago-crimes-net
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 9092 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  crime-stream:
+    <<: *spark-common
+    container_name: chicago-crimes-stream
+    profiles: ["streaming"]
+    environment:
+      <<: *spark-env
+      CHICAGO_CRIMES_SPARK_ROLE: runner
+    command: ["python", "-m", "chicago_crimes", "--profile", "standalone", "stream"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+      spark-master:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: chicago-crimes-postgres
+    profiles: ["orchestration"]
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - chicago-crimes-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_DB_USER:-airflow} -d ${AIRFLOW_DB_NAME:-airflow}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: infrastructure/airflow/Dockerfile
+    image: chicago-crimes-airflow:0.2.0
+    container_name: chicago-crimes-airflow-init
+    profiles: ["orchestration"]
+    environment: &airflow-env
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@postgres:5432/${AIRFLOW_DB_NAME:-airflow}
+      AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-chicago-crimes-local-airflow-key}
+      CHICAGO_CRIMES_DOCKER_NETWORK: chicago-crimes-platform_chicago-crimes-net
+      CHICAGO_CRIMES_AIRFLOW_CONTAINER: chicago-crimes-airflow
+      CHICAGO_CRIMES_SPARK_IMAGE: chicago-crimes-spark:0.2.0
+      SPARK_MASTER_URL: spark://spark-master:7077
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+      MINIO_BUCKET: ${MINIO_BUCKET:-chicago-crimes}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username "${AIRFLOW_ADMIN_USER:-admin}" \
+          --firstname Chicago --lastname Admin \
+          --role Admin --email admin@example.com \
+          --password "${AIRFLOW_ADMIN_PASSWORD:-admin}" || true
+    volumes:
+      - ./orchestration/dags:/opt/airflow/dags
+      - airflow-logs:/opt/airflow/logs
+    networks:
+      - chicago-crimes-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  airflow:
+    image: chicago-crimes-airflow:0.2.0
+    container_name: chicago-crimes-airflow
+    profiles: ["orchestration"]
+    group_add:
+      - "0"
+    ports:
+      - "8085:8080"
+    environment:
+      <<: *airflow-env
+    volumes:
+      - ./orchestration/dags:/opt/airflow/dags
+      - ./data:/app/data
+      - ./configs:/app/configs
+      - ./artifacts:/app/artifacts
+      - airflow-logs:/opt/airflow/logs
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - chicago-crimes-net
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow scheduler &
+        exec airflow webserver --port 8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
