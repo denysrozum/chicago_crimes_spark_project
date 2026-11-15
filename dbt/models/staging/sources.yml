@@ -1,0 +1,30 @@
+version: 2
+
+sources:
+  - name: chicago_crimes_lakehouse
+    description: >
+      Validated Silver and Gold crime tables exported from the PySpark/Delta lakehouse via
+      `chicago_crimes.storage.bigquery.publish_gold_and_silver_to_bigquery`.
+    tables:
+      - name: silver_crimes
+        description: Deduplicated and quality-flagged Silver crime incident records (geo nulls preserved).
+        columns:
+          - name: id
+            tests:
+              - not_null
+              - unique
+          - name: date
+            tests:
+              - not_null
+          - name: primary_type
+            tests:
+              - not_null
+          - name: has_valid_geo
+            tests:
+              - not_null
+      - name: daily_citywide_counts
+        description: Gold daily citywide incident, arrest, and domestic offense aggregates.
+      - name: daily_district_counts
+        description: Gold daily police district aggregates backing time-series forecasting.
+      - name: category_distribution
+        description: Gold primary offense shares, arrest rates, and domestic offense rates.

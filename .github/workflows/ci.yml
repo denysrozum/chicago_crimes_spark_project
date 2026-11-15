@@ -1,0 +1,54 @@
+name: CI Verification
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  lint-test-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17 (PySpark runtime)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up uv and Python 3.11
+        uses: astral-sh/setup-uv@v4
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Verify lockfile and install dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --all-extras
+
+      - name: Run Ruff linter
+        run: uv run ruff check src tests orchestration
+
+      - name: Run fast non-Docker unit, e2e, and structural tests
+        env:
+          MLFLOW_DISABLE_AGENT_HINT: "1"
+          GX_ANALYTICS_ENABLED: "False"
+        run: uv run pytest -m "not integration" -v
+
+      - name: Parse dbt BigQuery models offline
+        run: |
+          mkdir -p /tmp/chicago_dbt_profile
+          cp dbt/profiles.yml.example /tmp/chicago_dbt_profile/profiles.yml
+          uv run dbt parse --project-dir dbt --profiles-dir /tmp/chicago_dbt_profile --no-send-anonymous-usage-stats
+
+      - name: Validate Docker Compose definitions
+        run: |
+          cp -n .env.example .env || true
+          docker compose config --quiet
+          docker compose --profile orchestration config --quiet

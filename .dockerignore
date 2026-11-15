@@ -25,6 +25,16 @@ metastore_db/
 
 Dockerfile
 .dockerignore
-
+.cache/
+.pytest_cache/
+.ruff_cache/
 data/
 output/
+artifacts/
+stats/
+visualizations/
+business_plots/
+famd_results/
+imbalance_results/
+pca_results/
+sampling_results/

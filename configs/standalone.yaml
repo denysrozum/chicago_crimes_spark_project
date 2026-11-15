@@ -1,0 +1,39 @@
+# Distributed Spark Standalone + MinIO + Delta Lake profile
+
+spark:
+  app_name: ChicagoCrimesStandalone
+  profile: standalone
+  master: "spark://spark-master:7077"
+  driver_host: null
+  driver_bind_address: "0.0.0.0"
+  driver_memory: "1g"
+  executor_memory: "1536m"
+  executor_cores: 2
+  cores_max: 4
+  shuffle_partitions: 16
+  default_parallelism: 4
+  local_dir: "/tmp/chicago-crimes-spark"
+  log_level: "WARN"
+  session_timezone: "UTC"
+  enable_adaptive_execution: true
+  enable_delta: true
+
+storage:
+  backend: s3a
+  table_format: delta
+  s3_endpoint: "http://minio:9000"
+  s3_access_key: "minioadmin"
+  s3_secret_key: "minioadmin"
+  s3_bucket: "chicago-crimes"
+  s3_ssl_enabled: false
+
+streaming:
+  kafka_bootstrap_servers: "kafka:9092"
+  kafka_topic: "chicago-crimes.raw"
+  kafka_dlq_topic: "chicago-crimes.dlq"
+  checkpoint_location: "s3a://chicago-crimes/checkpoints/crime_stream"
+  bronze_stream_target: "s3a://chicago-crimes/streaming/bronze_crimes"
+  silver_stream_target: "s3a://chicago-crimes/silver/chicago_crimes"
+  quarantine_stream_target: "s3a://chicago-crimes/streaming/quarantine_crimes"
+  dlq_stream_target: "s3a://chicago-crimes/streaming/dlq_crimes"
+  metrics_log_path: "artifacts/streaming/microbatch_metrics.jsonl"
