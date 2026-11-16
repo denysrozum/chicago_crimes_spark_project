@@ -18,7 +18,37 @@
 - Validates `ID > 0`, non-null `Date` (`year >= 2001`), valid `Updated On` if present, non-empty `Primary Type`, and coordinate numeric parseability.
 - **Zero Synthetic Geographic Imputation**: Coordinates (`Latitude`, `Longitude`, `X Coordinate`, `Y Coordinate`, `Location`) are never replaced with neighborhood or city centroids. Missing or partial/out-of-bounds coordinates are nullified and flagged via `has_valid_geo` and `geo_quality_flag` (`valid`, `missing`, `partial_missing_nullified`, `out_of_bounds_nullified`, `invalid`).
 - **Administrative Preservation**: Missing `District` (`1..31`), `Ward` (`1..50`), or `Community Area` (`1..77`) values are preserved with `has_valid_admin` and `admin_quality_flag` rather than dropping incident records.
-- **Deterministic Deduplication / Upserts**: Batch Silver resolves duplicate `ID`s by latest `Updated On`; Delta streaming `MERGE` only updates target rows when `source.Updated On >= target.Updated On`.
+- **Deterministic Deduplication & Replay-Safe Delta `MERGE`**:
+  - **In-batch deduplication (`_rank_by_id`, `_deduplicate_source_batch`)**: Ranks duplicate `ID` rows by `Updated On DESC NULLS LAST` with a deterministic tie-breaker on the SHA-256 digest of normalized business payload columns (`Case Number`, `Date`, `Block`, `IUCR`, `Primary Type`, `Description`, `Location Description`, `Arrest`, `Domestic`, `Beat`, `District`, `Ward`, `Community Area`, `FBI Code`, `X Coordinate`, `Y Coordinate`, `source_year`, `Updated On`, `Latitude`, `Longitude`, `Location`).
+  - **Delta Lake `merge_silver_delta()` update policy**:
+    1. **Strictly newer source version**: `src.Updated On > target.Updated On` (both non-null) updates the target record.
+    2. **Older source version rejected**: `src.Updated On < target.Updated On` is ignored and never overwrites a newer target record.
+    3. **Null-timestamp source rejected against valid target**: `src.Updated On IS NULL AND target.Updated On IS NOT NULL` is rejected so missing update timestamps never overwrite valid target versions.
+    4. **Valid-timestamp source upgrades null-timestamp target**: `target.Updated On IS NULL AND src.Updated On IS NOT NULL` replaces the unversioned target record.
+    5. **Equal-timestamp conflict resolution**: When `src.Updated On <=> target.Updated On` (including both `NULL`), the update proceeds if and only if `_src_payload_digest > _target_payload_digest`, guaranteeing commutativity, determinism, and zero no-op writes on identical replays.
+    6. **Safe new-record insertion**: Unmatched `ID` records (including those with `Updated On IS NULL`) are inserted via `whenNotMatchedInsertAll()`.
+
+### Chicago Timestamp & Timezone Semantics (`America/Chicago` vs `UTC`)
+
+The platform explicitly separates six distinct temporal concepts:
+
+1. **Chicago Local Event Time (`Date`, `ts`)**:
+   - Raw historical CSV strings (`MM/dd/yyyy hh:mm:ss a`, e.g., `01/01/2001 12:00:00 AM`) and SODA floating timestamps (`yyyy-MM-dd'T'HH:mm:ss.SSS`) represent wall-clock local time in `America/Chicago` (`CST = UTC-6` in winter; `CDT = UTC-5` in summer).
+   - Spark sessions run with `spark.sql.session.timeZone=UTC` for deterministic cross-host execution, so `Date` and `ts` store the exact Chicago wall-clock components without host-OS timezone drift.
+2. **Derived UTC Event Instant (`ts_utc`) & DST Classification (`timestamp_dst_flag`)**:
+   - `ts_utc` converts `ts` from `America/Chicago` wall-clock time to an unambiguous UTC instant via `to_utc_timestamp(ts, 'America/Chicago')` **only** when the local wall-clock time is unambiguous:
+     - Winter CST example (`UTC-6`): `2001-01-01 00:00:00` local (`America/Chicago`) -> `2001-01-01T06:00:00Z` (`timestamp_dst_flag = "valid_cst"`).
+     - Summer CDT example (`UTC-5`): `2025-07-04 19:30:00` local (`America/Chicago`) -> `2025-07-05T00:30:00Z` (`timestamp_dst_flag = "valid_cdt"`).
+   - **DST Spring-Forward Nonexistent Hour (`dst_spring_gap_nonexistent`)**: Local wall-clock values falling inside the spring DST transition gap (e.g., `02:00:00..02:59:59` on the transition Sunday) do not exist in `America/Chicago`. `ts` and local calendar fields are preserved as reported by the source, while `ts_utc` is set to `NULL` rather than inventing a synthetic UTC offset (`253` records in the full dataset).
+   - **DST Fall-Back Ambiguous Hour (`dst_fall_fold_ambiguous`)**: Local wall-clock values falling inside the repeated `01:00:00..01:59:59` autumn transition hour occur twice (once in CDT `UTC-5` and once in CST `UTC-6`) without an offset indicator in the source data. `ts` and local calendar fields are preserved, `timestamp_dst_flag` is set to `"dst_fall_fold_ambiguous"`, and `ts_utc` is set to `NULL` (`1,662` records in the full dataset).
+3. **Source `Updated On` Semantics**:
+   - Represents the upstream Chicago Police Department / SODA record modification timestamp (`America/Chicago` wall-clock floating timestamp), used strictly for version ordering (`Updated On DESC NULLS LAST`) and incremental SODA polling watermarks.
+4. **Ingestion & Streaming Timestamps (`ingestion_timestamp`, `kafka_timestamp`, `quarantined_at_utc`)**:
+   - Recorded as true UTC instants at the moment of batch ingestion, Kafka broker append, or DLQ/quarantine routing.
+5. **Calendar Dates for Historical Aggregation (`crime_date`, `year_month`, `year`, `month`, `hour`, `day_of_week_num`, `day_of_week`)**:
+   - Derived directly from Chicago local wall-clock time (`ts`) so midnight and daily/monthly boundaries reflect actual Chicago calendar dates (`2001-01-01` through `2026-02-07`, `302` months `2001-01..2026-02`).
+6. **Calendar Features for ML Forecasting (`year`, `month`, `day_of_month`, `day_of_week_num`, `is_weekend`)**:
+   - Constructed from the Chicago local calendar date (`crime_date`) in `daily_district_counts` before computing leakage-free causal lags (`lag_1`, `lag_7`) and rolling statistics (`rolling_mean_7`, `rolling_std_7`, `rolling_mean_14`).
 
 ### Strict Row Accounting Invariant
 
@@ -47,18 +77,22 @@ Verified full-dataset batch Silver accounting (`data/silver/chicago_crimes/_silv
 | `out_of_bounds_geo_nullified` | `149` |
 | `missing_admin_records` (preserved instead of legacy drop) | `616,418` |
 | `out_of_range_admin_nullified` | `76` |
+| `valid_cst` (`timestamp_dst_flag`) | `2,952,268` |
+| `valid_cdt` (`timestamp_dst_flag`) | `5,541,217` |
+| `dst_fall_fold_ambiguous` (`ts_utc = NULL`) | `1,662` |
+| `dst_spring_gap_nonexistent` (`ts_utc = NULL`) | `253` |
 
 ### Gold Analytical Tables
 
-Materialized by `chicago-crimes gold` (`data/gold/_gold_manifest.json`) with documented denominators (`arrest_count / incident_count * 100`, `domestic_count / incident_count * 100`, and valid-geo filtering on spatial cells):
+Materialized by `chicago-crimes gold` (`data/gold/_gold_manifest.json`) on Chicago local calendar boundaries (`ts`) with documented denominators (`arrest_count / incident_count * 100`, `domestic_count / incident_count * 100`, and valid-geo filtering on spatial cells):
 
-- `daily_citywide_counts` (`9,169` rows)
-- `monthly_crime_summary` (`303` rows; includes boundary `2000-12` under `UTC` session timezone on legacy-materialized Silver `Date` values)
+- `daily_citywide_counts` (`9,169` rows; `2001-01-01`..`2026-02-07`)
+- `monthly_crime_summary` (`302` rows; `2001-01`..`2026-02`)
 - `district_community_summary` (`422` rows)
 - `category_distribution` (`34` rows)
 - `temporal_hourly_profile` (`2,016` rows)
 - `spatial_valid_grid_summary` (`738` rows; built strictly from `has_valid_geo = true`)
-- `daily_district_counts` (`201,982` rows; consumed by chronological ML forecasting)
+- `daily_district_counts` (`201,970` rows; consumed by chronological ML forecasting)
 
 ## Analytical Task Registry (`AQ-01`..`AQ-24`)
 
@@ -127,7 +161,7 @@ All batch CSV inputs are ingested non-destructively as `StringType` columns plus
 
 ## Silver Casting, Quarantine, Quality Flags & Derived Features
 
-- **Safe Casting & Timestamps**: Numeric fields use `try_cast`; `Date` and `Updated On` accept `MM/dd/yyyy hh:mm:ss a`, `MM/dd/yyyy HH:mm:ss`, `yyyy-MM-dd'T'HH:mm:ss.SSS`, `yyyy-MM-dd'T'HH:mm:ss`, `yyyy-MM-dd HH:mm:ss`, and `yyyy-MM-dd`. Spark runs with `spark.sql.session.timeZone=UTC`, whereas historical CSV strings represent Chicago wall-clock timestamps (note boundary records near `2000-12-31T22:00:00Z`).
+- **Safe Casting & Timestamps**: Numeric fields use `try_cast`; `Date` and `Updated On` accept `MM/dd/yyyy hh:mm:ss a`, `MM/dd/yyyy HH:mm:ss`, `yyyy-MM-dd'T'HH:mm:ss.SSS`, `yyyy-MM-dd'T'HH:mm:ss`, `yyyy-MM-dd HH:mm:ss`, and `yyyy-MM-dd`. Spark runs with `spark.sql.session.timeZone=UTC`, preserving Chicago local wall-clock fields (`Date`, `ts`, `year`, `month`, `hour`, `day_of_week_num`, `day_of_week`) while explicitly deriving `ts_utc` (`America/Chicago` -> `UTC`, or `NULL` on spring-gap/fall-fold rows) and `timestamp_dst_flag`.
 - **Quarantine Reasons (`quarantine_reason`, `quarantined_at`)**:
   - `corrupt_csv_row`
   - `missing_or_invalid_id`
@@ -140,7 +174,7 @@ All batch CSV inputs are ingested non-destructively as `StringType` columns plus
 - **Non-Destructive Quality Flags**:
   - `has_valid_geo` (`boolean`) and `geo_quality_flag` in `{valid, missing, partial_missing_nullified, out_of_bounds_nullified, invalid}`.
   - `has_valid_admin` (`boolean`) and `admin_quality_flag` in `{valid, partial_or_missing, out_of_range_nullified}`.
-- **Derived Enriched Silver Columns**: `ts`, `hour`, `year`, `month`, `day_of_week_num` (`1=Sun..7=Sat`), `day_of_week`, `block_number` (non-imputed in Silver), `direction`, `street_type`, `street_name`, `geo_grid` (`floor(coord * round(1/grid_size))`, default `0.01`), plus `source_year`.
+- **Derived Enriched Silver Columns**: `ts`, `ts_utc`, `timestamp_dst_flag`, `hour`, `year`, `month`, `day_of_week_num` (`1=Sun..7=Sat`), `day_of_week`, `block_number` (non-imputed in Silver), `direction`, `street_type`, `street_name`, `geo_grid` (`floor(coord * round(1/grid_size))`, default `0.01`), plus `source_year`.
 - **Accounting Invariant**: Every Silver run verifies `input_records == accepted_records + superseded_records + quarantined_records`.
 
 ## dbt BigQuery Layer Contracts (`dbt/models/`)
