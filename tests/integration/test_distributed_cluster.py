@@ -31,7 +31,13 @@ def _require_live_cluster() -> dict:
     return info
 
 
-def _write_synthetic_raw_csv(path: Path, *, rows: int, arrest_flag: str = "false") -> None:
+def _write_synthetic_raw_csv(
+    path: Path,
+    *,
+    rows: int,
+    arrest_flag: str = "false",
+    updated_on: str = "01/15/2026 10:00:00 AM",
+) -> None:
     headers = (
         "ID;Case Number;Date;Block;IUCR;Primary Type;Description;"
         "Location Description;Arrest;Domestic;Beat;District;Ward;"
@@ -51,7 +57,7 @@ def _write_synthetic_raw_csv(path: Path, *, rows: int, arrest_flag: str = "false
             f"{cid};HZ{cid:06d};{month:02d}/{day:02d}/{year} 02:15:00 PM;"
             f"001XX N STATE ST;0820;THEFT;OVER $500;STREET;{arrest_flag};false;"
             f"0111;{district:03d};42;32;06;1176000;1900000;{year};"
-            f"01/15/2026 10:00:00 AM;{lat:.6f};{lon:.6f};({lat:.6f}, {lon:.6f})"
+            f"{updated_on};{lat:.6f};{lon:.6f};({lat:.6f}, {lon:.6f})"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -118,7 +124,12 @@ def test_live_standalone_delta_sync_merge_and_executor_distribution() -> None:
 
     total_rows = 240
     _write_synthetic_raw_csv(host_run_dir / "raw_base.csv", rows=total_rows, arrest_flag="false")
-    _write_synthetic_raw_csv(host_run_dir / "raw_upd.csv", rows=40, arrest_flag="true")
+    _write_synthetic_raw_csv(
+        host_run_dir / "raw_upd.csv",
+        rows=40,
+        arrest_flag="true",
+        updated_on="01/16/2026 10:00:00 AM",
+    )
     try:
         for csv_name, out_name in (
             ("raw_base.csv", "silver_base"),

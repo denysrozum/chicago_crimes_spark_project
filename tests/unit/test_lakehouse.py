@@ -286,3 +286,164 @@ def test_sync_delta_and_benchmark_cli(spark: SparkSession, tmp_path: Path) -> No
     # Unreachable master UI degrades gracefully to None
     assert inspect_spark_master_cluster("http://127.0.0.1:19999") is None
     _ = write_delta
+
+
+def _make_typed_crime_row(
+    cid: int,
+    *,
+    description: str,
+    arrest: bool = False,
+    updated_on: datetime | None = None,
+    date: datetime = datetime(2024, 5, 1, 10, 0, 0),
+) -> tuple[object, ...]:
+    return (
+        cid,
+        f"HJ{cid}",
+        date,
+        "001XX N STATE ST",
+        "0820",
+        "THEFT",
+        description,
+        "STREET",
+        arrest,
+        False,
+        111,
+        1,
+        42,
+        32,
+        "06",
+        1176352,
+        1900927,
+        date.year,
+        updated_on,
+        41.8835,
+        -87.6278,
+        "(41.8835, -87.6278)",
+    )
+
+
+def test_merge_silver_delta_versioning_safety_matrix(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    """Cover all 8 mandatory Delta MERGE versioning, null-timestamp, tie, and replay rules."""
+    t_old = datetime(2024, 1, 5, 12, 0, 0)
+    t_mid = datetime(2024, 6, 10, 12, 0, 0)
+    t_new = datetime(2025, 2, 15, 12, 0, 0)
+
+    delta_path = tmp_path / "silver_versioning"
+    # Seed table with:
+    # - ID=1: valid timestamp t_mid ("V1_MID")
+    # - ID=2: null timestamp ("V1_NULL_TARGET")
+    # - ID=3: valid timestamp t_mid ("PAYLOAD_ALPHA") for equal-timestamp conflict resolution
+    seed_df = spark.createDataFrame(
+        [
+            _make_typed_crime_row(1, description="V1_MID", arrest=False, updated_on=t_mid),
+            _make_typed_crime_row(2, description="V1_NULL_TARGET", arrest=False, updated_on=None),
+            _make_typed_crime_row(3, description="PAYLOAD_ALPHA", arrest=False, updated_on=t_mid),
+        ],
+        schema=RAW_CRIME_SCHEMA,
+    )
+    merge_silver_delta(spark, seed_df, delta_path)
+
+    # Case 1: Newer event updating an existing record (ID=1: t_new > t_mid)
+    df_newer = spark.createDataFrame(
+        [_make_typed_crime_row(1, description="V2_NEWER", arrest=True, updated_on=t_new)],
+        schema=RAW_CRIME_SCHEMA,
+    )
+    merge_silver_delta(spark, df_newer, delta_path)
+    rows = {r["ID"]: r for r in read_delta(spark, delta_path).collect()}
+    assert rows[1]["Description"] == "V2_NEWER"
+    assert rows[1]["Arrest"] is True
+
+    # Case 2: Older event rejected (ID=1: t_old < t_new)
+    df_older = spark.createDataFrame(
+        [_make_typed_crime_row(1, description="STALE_OLDER", arrest=False, updated_on=t_old)],
+        schema=RAW_CRIME_SCHEMA,
+    )
+    merge_silver_delta(spark, df_older, delta_path)
+    rows = {r["ID"]: r for r in read_delta(spark, delta_path).collect()}
+    assert rows[1]["Description"] == "V2_NEWER"
+    assert rows[1]["Arrest"] is True
+
+    # Case 3: Null-timestamp source vs valid-timestamp target MUST BE REJECTED (ID=1)
+    df_null_src = spark.createDataFrame(
+        [
+            _make_typed_crime_row(
+                1, description="NULL_OVERWRITE_ATTEMPT", arrest=False, updated_on=None
+            )
+        ],
+        schema=RAW_CRIME_SCHEMA,
+    )
+    merge_silver_delta(spark, df_null_src, delta_path)
+    rows = {r["ID"]: r for r in read_delta(spark, delta_path).collect()}
+    assert rows[1]["Description"] == "V2_NEWER"
+    assert rows[1]["Updated On"] is not None
+
+    # Case 4: Valid-timestamp source vs null-timestamp target MUST UPDATE (ID=2)
+    df_valid_over_null = spark.createDataFrame(
+        [
+            _make_typed_crime_row(
+                2, description="UPGRADED_FROM_NULL", arrest=True, updated_on=t_old
+            )
+        ],
+        schema=RAW_CRIME_SCHEMA,
+    )
+    merge_silver_delta(spark, df_valid_over_null, delta_path)
+    rows = {r["ID"]: r for r in read_delta(spark, delta_path).collect()}
+    assert rows[2]["Description"] == "UPGRADED_FROM_NULL"
+    assert rows[2]["Arrest"] is True
+    assert rows[2]["Updated On"] is not None
+
+    # Also verify new record with missing timestamp inserts safely (`WHEN NOT MATCHED`)
+    df_new_null = spark.createDataFrame(
+        [_make_typed_crime_row(4, description="NEW_WITH_NULL_TS", arrest=False, updated_on=None)],
+        schema=RAW_CRIME_SCHEMA,
+    )
+    merge_silver_delta(spark, df_new_null, delta_path)
+    rows = {r["ID"]: r for r in read_delta(spark, delta_path).collect()}
+    assert rows[4]["Description"] == "NEW_WITH_NULL_TS"
+    assert rows[4]["Updated On"] is None
+
+    # Case 5 & 6: Equal timestamps with different payloads & duplicate records in same microbatch
+    # Verify commutativity: applying (PAYLOAD_ALPHA, PAYLOAD_BETA) in one batch or across two
+    # batches in either order produces the exact same deterministic winner.
+    row_a = _make_typed_crime_row(3, description="PAYLOAD_ALPHA", arrest=False, updated_on=t_mid)
+    row_b = _make_typed_crime_row(3, description="PAYLOAD_BETA", arrest=True, updated_on=t_mid)
+
+    path_ab = tmp_path / "tie_ab"
+    path_ba = tmp_path / "tie_ba"
+    path_inbatch_1 = tmp_path / "tie_inbatch_1"
+    path_inbatch_2 = tmp_path / "tie_inbatch_2"
+
+    merge_silver_delta(spark, spark.createDataFrame([row_a], schema=RAW_CRIME_SCHEMA), path_ab)
+    merge_silver_delta(spark, spark.createDataFrame([row_b], schema=RAW_CRIME_SCHEMA), path_ab)
+
+    merge_silver_delta(spark, spark.createDataFrame([row_b], schema=RAW_CRIME_SCHEMA), path_ba)
+    merge_silver_delta(spark, spark.createDataFrame([row_a], schema=RAW_CRIME_SCHEMA), path_ba)
+
+    merge_silver_delta(
+        spark, spark.createDataFrame([row_a, row_b], schema=RAW_CRIME_SCHEMA), path_inbatch_1
+    )
+    merge_silver_delta(
+        spark, spark.createDataFrame([row_b, row_a], schema=RAW_CRIME_SCHEMA), path_inbatch_2
+    )
+
+    winner_ab = read_delta(spark, path_ab).first()["Description"]
+    winner_ba = read_delta(spark, path_ba).first()["Description"]
+    winner_ib1 = read_delta(spark, path_inbatch_1).first()["Description"]
+    winner_ib2 = read_delta(spark, path_inbatch_2).first()["Description"]
+    assert winner_ab == winner_ba == winner_ib1 == winner_ib2
+
+    # Case 7: Replaying an already committed microbatch does not alter Silver state or metrics
+    snapshot_before = {
+        r["ID"]: (r["Description"], r["Arrest"])
+        for r in read_delta(spark, delta_path).collect()
+    }
+    replay_res = merge_silver_delta(spark, df_newer, delta_path)
+    assert int(replay_res["metrics"].get("numTargetRowsUpdated", "0")) == 0
+    assert int(replay_res["metrics"].get("numTargetRowsInserted", "0")) == 0
+    snapshot_after = {
+        r["ID"]: (r["Description"], r["Arrest"])
+        for r in read_delta(spark, delta_path).collect()
+    }
+    assert snapshot_after == snapshot_before
