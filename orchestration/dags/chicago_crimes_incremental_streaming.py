@@ -27,7 +27,9 @@ with DAG(
     tags=["chicago-crimes", "streaming", "soda", "kafka"],
     params={
         "since": Param("", type=["null", "string"]),
-        "limit": Param(100, type="integer", minimum=1),
+        "limit": Param(2000, type="integer", minimum=1),
+        "page_size": Param(500, type="integer", minimum=1),
+        "max_pages": Param(5, type="integer", minimum=1),
         "kafka_topic": Param("chicago-crimes.orchestrated", type="string"),
         "watermark_file": Param("artifacts/airflow/state/soda_watermark.json", type="string"),
         "checkpoint": Param("s3a://chicago-crimes/checkpoints/airflow_stream", type="string"),
@@ -49,6 +51,8 @@ with DAG(
             "ingest-soda "
             "{% if params.since %}--since {{ params.since }} {% endif %}"
             "--limit {{ params.limit }} "
+            "--page-size {{ params.page_size }} "
+            "--max-pages {{ params.max_pages }} "
             "--publish-kafka "
             "--bootstrap-servers kafka:9092 "
             "--topic {{ params.kafka_topic }} "

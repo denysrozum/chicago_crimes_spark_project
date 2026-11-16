@@ -110,25 +110,80 @@ def delta_history(
     return entries
 
 
+def _payload_digest_expr(
+    columns: Sequence[str],
+    *,
+    alias_prefix: str = "",
+    key_col: str = "ID",
+    update_order_col: str = "Updated On",
+) -> Any:
+    """Compute a deterministic SHA-256 digest over canonical business payload columns."""
+    excluded = {
+        key_col,
+        update_order_col,
+        "ingestion_timestamp",
+        "ingestion_batch_id",
+        "source_id",
+        "kafka_topic",
+        "kafka_partition",
+        "kafka_offset",
+        "kafka_timestamp",
+        "stream_event_id",
+        "microbatch_id",
+        "_merge_rn",
+        "_merge_tiebreaker",
+    }
+    business_cols = sorted(col for col in columns if col not in excluded)
+    prefix = f"{alias_prefix}." if alias_prefix else ""
+    if not business_cols:
+        return F.lit("")
+    return F.sha2(
+        F.concat_ws(
+            "||",
+            *[
+                F.coalesce(F.col(f"{prefix}`{col}`").cast("string"), F.lit("<NULL>"))
+                for col in business_cols
+            ],
+        ),
+        256,
+    )
+
+
 def _deduplicate_source_batch(
     df: DataFrame,
     *,
     key_col: str,
     update_order_col: str,
 ) -> DataFrame:
-    """Keep strictly one newest row per key inside a micro-batch before Delta MERGE."""
-    order_cols = [F.col(update_order_col).desc_nulls_last()]
-    if "ingestion_timestamp" in df.columns:
+    """Keep strictly one deterministic winner per key inside a micro-batch before Delta MERGE.
+
+    Ordering precedence per `key_col`:
+    1. Newest non-null `update_order_col` (`Updated On DESC NULLS LAST`).
+    2. Deterministic SHA-256 digest over canonical business payload columns (`DESC`), ensuring
+       identical tie resolution regardless of Spark partition ordering, arrival order, or
+       ingestion batch wrapper metadata.
+    3. Newest `ingestion_timestamp`, `kafka_partition`, and `kafka_offset` when payloads are
+       identical.
+    """
+    staged = df.withColumn(
+        "_merge_tiebreaker",
+        _payload_digest_expr(df.columns, key_col=key_col, update_order_col=update_order_col),
+    )
+    order_cols = [
+        F.col(f"`{update_order_col}`").desc_nulls_last(),
+        F.col("_merge_tiebreaker").desc(),
+    ]
+    if "ingestion_timestamp" in staged.columns:
         order_cols.append(F.col("ingestion_timestamp").desc_nulls_last())
-    if "kafka_partition" in df.columns:
+    if "kafka_partition" in staged.columns:
         order_cols.append(F.col("kafka_partition").desc_nulls_last())
-    if "kafka_offset" in df.columns:
+    if "kafka_offset" in staged.columns:
         order_cols.append(F.col("kafka_offset").desc_nulls_last())
-    win = Window.partitionBy(key_col).orderBy(*order_cols)
+    win = Window.partitionBy(F.col(f"`{key_col}`")).orderBy(*order_cols)
     return (
-        df.withColumn("_merge_rn", F.row_number().over(win))
+        staged.withColumn("_merge_rn", F.row_number().over(win))
         .filter(F.col("_merge_rn") == 1)
-        .drop("_merge_rn")
+        .drop("_merge_rn", "_merge_tiebreaker")
     )
 
 
@@ -284,6 +339,66 @@ def merge_insert_only_delta(
     }
 
 
+def _build_silver_merge_update_guard(
+    target_columns: Sequence[str],
+    source_columns: Sequence[str],
+    *,
+    key_col: str,
+    update_order_col: str,
+) -> str:
+    """Construct a monotonic, deterministic SQL update predicate for Silver Delta MERGE.
+
+    Versioning policy:
+    1. Strictly newer source timestamp (`src.Updated On > target.Updated On`) updates target.
+    2. Valid source timestamp replaces a null target timestamp
+       (`target.Updated On IS NULL AND src.Updated On IS NOT NULL`).
+    3. Null source timestamp never replaces a valid target timestamp.
+    4. Equal timestamps (`src.Updated On <=> target.Updated On`, including both NULL) resolve
+       deterministically by comparing the SHA-256 digest of shared canonical business payload
+       columns (`src_digest > target_digest`), guaranteeing commutative, order-independent,
+       and replay-safe conflict resolution.
+    """
+    excluded = {
+        key_col,
+        update_order_col,
+        "ingestion_timestamp",
+        "ingestion_batch_id",
+        "source_id",
+        "kafka_topic",
+        "kafka_partition",
+        "kafka_offset",
+        "kafka_timestamp",
+        "stream_event_id",
+        "microbatch_id",
+        "_merge_rn",
+        "_merge_tiebreaker",
+    }
+    shared_business_cols = sorted(
+        (set(target_columns) & set(source_columns)) - excluded
+    )
+    if shared_business_cols:
+        src_parts = ", ".join(
+            f"coalesce(cast(src.`{col}` as string), '<NULL>')" for col in shared_business_cols
+        )
+        tgt_parts = ", ".join(
+            f"coalesce(cast(target.`{col}` as string), '<NULL>')" for col in shared_business_cols
+        )
+        tie_breaker_sql = (
+            f"sha2(concat_ws('||', {src_parts}), 256) > "
+            f"sha2(concat_ws('||', {tgt_parts}), 256)"
+        )
+    else:
+        tie_breaker_sql = "false"
+
+    return (
+        f"(target.`{update_order_col}` IS NOT NULL "
+        f"AND src.`{update_order_col}` IS NOT NULL "
+        f"AND src.`{update_order_col}` > target.`{update_order_col}`) "
+        f"OR (target.`{update_order_col}` IS NULL AND src.`{update_order_col}` IS NOT NULL) "
+        f"OR ((src.`{update_order_col}` <=> target.`{update_order_col}`) AND ({tie_breaker_sql}))"
+    )
+
+
 def merge_silver_delta(
     spark: SparkSession,
     source_df: DataFrame,
@@ -311,10 +426,13 @@ def merge_silver_delta(
         }
 
     delta_tbl = DeltaTable.forPath(spark, target_str)
+    target_cols = delta_tbl.toDF().columns
     match_expr = f"target.`{key_col}` = src.`{key_col}`"
-    update_guard = (
-        f"target.`{update_order_col}` IS NULL OR src.`{update_order_col}` IS NULL "
-        f"OR src.`{update_order_col}` >= target.`{update_order_col}`"
+    update_guard = _build_silver_merge_update_guard(
+        target_cols,
+        deduped.columns,
+        key_col=key_col,
+        update_order_col=update_order_col,
     )
     with _delta_schema_automerge(spark):
         (

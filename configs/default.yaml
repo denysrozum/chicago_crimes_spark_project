@@ -58,6 +58,7 @@ experiments:
 streaming:
   soda_endpoint: "https://data.cityofchicago.org/resource/ijzp-q8t2.json"
   soda_page_size: 1000
+  soda_max_pages_per_run: 10
   soda_overlap_seconds: 60
   watermark_path: "artifacts/state/soda_watermark.json"
   kafka_bootstrap_servers: "localhost:9094"

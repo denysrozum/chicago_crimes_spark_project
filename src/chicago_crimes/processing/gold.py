@@ -71,7 +71,7 @@ def _incident_aggs() -> tuple[Any, Any, Any]:
 def compute_gold_dataframes(silver_df: DataFrame, total_incidents: int) -> dict[str, DataFrame]:
     """Compute all seven Gold aggregate DataFrames from a validated Silver DataFrame."""
     base = add_temporal_features(silver_df, date_col="Date").withColumn(
-        "crime_date", F.to_date("Date")
+        "crime_date", F.to_date("ts")
     )
 
     daily_citywide = (
@@ -83,7 +83,7 @@ def compute_gold_dataframes(silver_df: DataFrame, total_incidents: int) -> dict[
     )
 
     monthly_summary = (
-        base.withColumn("year_month", F.date_format("Date", "yyyy-MM"))
+        base.withColumn("year_month", F.date_format("ts", "yyyy-MM"))
         .groupBy("year_month", "year", "month")
         .agg(*_incident_aggs())
         .withColumn("arrest_rate_percent", _rate_expr("arrest_count"))

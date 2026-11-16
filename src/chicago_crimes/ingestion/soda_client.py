@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -21,6 +22,7 @@ from chicago_crimes.core.schemas import RAW_CRIME_COLUMNS
 logger = get_logger("ingestion.soda")
 
 DEFAULT_SODA_ENDPOINT = "https://data.cityofchicago.org/resource/ijzp-q8t2.json"
+CHICAGO_TZ = ZoneInfo("America/Chicago")
 
 SODA_TO_BRONZE_FIELD_MAP: dict[str, str] = {
     "ID": "id",
@@ -57,8 +59,12 @@ class SodaWatermark:
     last_updated_on: str | None = None
     last_id: str | None = None
     records_fetched: int = 0
+    cumulative_records_fetched: int = 0
     last_batch_id: str | None = None
     updated_at_utc: str | None = None
+    has_more: bool = False
+    backlog_detected: bool = False
+    ingestion_lag_seconds: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -75,10 +81,14 @@ class SodaFetchResult:
     effective_where: str
     pages_fetched: int
     raw_count: int
+    skipped_committed_count: int = 0
+    has_more: bool = False
+    backlog_detected: bool = False
+    ingestion_lag_seconds: float | None = None
 
 
 def parse_soda_timestamp(value: str | datetime) -> datetime:
-    """Parse an ISO-8601 SODA timestamp into a naive UTC datetime."""
+    """Parse a SODA floating timestamp (`America/Chicago` wall-clock) into a naive datetime."""
     if isinstance(value, datetime):
         if value.tzinfo is not None:
             return value.astimezone(UTC).replace(tzinfo=None)
@@ -98,18 +108,48 @@ def format_soda_timestamp(value: str | datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}"
 
 
+def compute_ingestion_lag_seconds(
+    last_updated_on: str | datetime | None,
+    *,
+    now_utc: datetime | None = None,
+) -> float | None:
+    """Compute lag in seconds between the latest `updated_on` (`America/Chicago`) and `now_utc`."""
+    if last_updated_on is None:
+        return None
+    local_dt = parse_soda_timestamp(last_updated_on)
+    local_aware = local_dt.replace(tzinfo=CHICAGO_TZ)
+    event_utc = local_aware.astimezone(UTC)
+    ref_utc = (
+        now_utc.astimezone(UTC)
+        if now_utc is not None and now_utc.tzinfo is not None
+        else (now_utc.replace(tzinfo=UTC) if now_utc is not None else datetime.now(UTC))
+    )
+    return round(max(0.0, (ref_utc - event_utc).total_seconds()), 3)
+
+
 def load_watermark(path: str | Path) -> SodaWatermark | None:
     """Load persisted SODA watermark from JSON if it exists."""
     target = Path(path)
     if not target.is_file():
         return None
     payload = json.loads(target.read_text(encoding="utf-8"))
+    records_fetched = int(payload.get("records_fetched", 0))
     return SodaWatermark(
         last_updated_on=payload.get("last_updated_on"),
         last_id=payload.get("last_id"),
-        records_fetched=int(payload.get("records_fetched", 0)),
+        records_fetched=records_fetched,
+        cumulative_records_fetched=int(
+            payload.get("cumulative_records_fetched", records_fetched)
+        ),
         last_batch_id=payload.get("last_batch_id"),
         updated_at_utc=payload.get("updated_at_utc"),
+        has_more=bool(payload.get("has_more", False)),
+        backlog_detected=bool(payload.get("backlog_detected", False)),
+        ingestion_lag_seconds=(
+            float(payload["ingestion_lag_seconds"])
+            if payload.get("ingestion_lag_seconds") is not None
+            else None
+        ),
     )
 
 
@@ -132,22 +172,52 @@ def build_incremental_where(
     default_lookback_hours: int = 72,
     now_utc: datetime | None = None,
 ) -> str:
-    """Build deterministic SoQL `$where` filter using `since` or overlapped watermark."""
+    """Build deterministic SoQL `$where` filter using `since` or composite watermark cursor.
+
+    When `watermark` includes `last_updated_on` and `last_id`:
+    - If `overlap_seconds == 0` or `watermark.has_more` is True (continuing a multi-poll catch-up),
+      uses `(updated_on > '<ts>' OR (updated_on = '<ts>' AND id > '<id>'))` so batches sharing an
+      identical `updated_on` timestamp never stall or skip rows.
+    - If `overlap_seconds > 0` after a fully drained poll, queries the overlap window
+      `[last_updated_on - overlap_seconds, last_updated_on)` for late-published rows while still
+      advancing strictly past `last_id` at `updated_on = '<last_updated_on>'`.
+    """
+    clauses: list[str] = []
     if since is not None:
         start_dt = parse_soda_timestamp(since)
+        clauses.append(f"updated_on >= '{format_soda_timestamp(start_dt)}'")
     elif watermark is not None and watermark.last_updated_on:
-        start_dt = parse_soda_timestamp(watermark.last_updated_on) - timedelta(
-            seconds=max(0, overlap_seconds)
-        )
+        wm_ts = format_soda_timestamp(watermark.last_updated_on)
+        effective_overlap = 0 if watermark.has_more else max(0, overlap_seconds)
+        if watermark.last_id:
+            safe_id = str(watermark.last_id).replace("'", "''")
+            if effective_overlap == 0:
+                clauses.append(
+                    f"(updated_on > '{wm_ts}' OR (updated_on = '{wm_ts}' AND id > '{safe_id}'))"
+                )
+            else:
+                start_dt = parse_soda_timestamp(watermark.last_updated_on) - timedelta(
+                    seconds=effective_overlap
+                )
+                overlap_ts = format_soda_timestamp(start_dt)
+                clauses.append(
+                    f"updated_on >= '{overlap_ts}' "
+                    f"AND (updated_on != '{wm_ts}' OR id > '{safe_id}')"
+                )
+        else:
+            start_dt = parse_soda_timestamp(watermark.last_updated_on) - timedelta(
+                seconds=effective_overlap
+            )
+            clauses.append(f"updated_on >= '{format_soda_timestamp(start_dt)}'")
     else:
         anchor = (
             parse_soda_timestamp(now_utc)
             if now_utc
-            else datetime.now(UTC).replace(tzinfo=None)
+            else datetime.now(CHICAGO_TZ).replace(tzinfo=None)
         )
         start_dt = anchor - timedelta(hours=max(1, default_lookback_hours))
+        clauses.append(f"updated_on >= '{format_soda_timestamp(start_dt)}'")
 
-    clauses = [f"updated_on >= '{format_soda_timestamp(start_dt)}'"]
     if until is not None:
         clauses.append(f"updated_on <= '{format_soda_timestamp(until)}'")
     return " AND ".join(clauses)
@@ -277,6 +347,7 @@ def fetch_soda_incremental(
     since: str | datetime | None = None,
     until: str | datetime | None = None,
     page_size: int | None = None,
+    max_pages: int | None = None,
     overlap_seconds: int | None = None,
     default_lookback_hours: int = 72,
     max_records: int | None = None,
@@ -287,12 +358,14 @@ def fetch_soda_incremental(
     base_backoff_seconds: float = 1.0,
     session: requests.Session | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    now_utc: datetime | None = None,
 ) -> SodaFetchResult:
     """Fetch ordered incremental crime records from the official SODA endpoint."""
     cfg = streaming_cfg or StreamingConfig()
     effective_endpoint = endpoint or cfg.soda_endpoint
     effective_token = app_token if app_token is not None else cfg.soda_app_token
     effective_page_size = page_size or cfg.soda_page_size
+    effective_max_pages = max_pages or cfg.soda_max_pages_per_run
     effective_overlap = cfg.soda_overlap_seconds if overlap_seconds is None else overlap_seconds
 
     prior_watermark = watermark
@@ -305,6 +378,7 @@ def fetch_soda_incremental(
         until=until,
         overlap_seconds=effective_overlap,
         default_lookback_hours=default_lookback_hours,
+        now_utc=now_utc,
     )
 
     headers: dict[str, str] = {"Accept": "application/json"}
@@ -312,16 +386,23 @@ def fetch_soda_incremental(
         headers["X-App-Token"] = effective_token
 
     run_batch_id = batch_id or uuid4().hex
-    ingested_at = datetime.now(UTC).replace(tzinfo=None)
+    ingested_at = (
+        now_utc.astimezone(UTC).replace(tzinfo=None)
+        if now_utc is not None and now_utc.tzinfo is not None
+        else (now_utc if now_utc is not None else datetime.now(UTC).replace(tzinfo=None))
+    )
     own_session = session is None
     client = session or requests.Session()
 
     raw_records: list[dict[str, Any]] = []
     pages_fetched = 0
     offset = 0
+    exhausted_source = False
 
     try:
         while True:
+            if effective_max_pages is not None and pages_fetched >= effective_max_pages:
+                break
             remaining = (
                 effective_page_size
                 if max_records is None
@@ -348,15 +429,18 @@ def fetch_soda_incremental(
             )
             pages_fetched += 1
             if not page:
+                exhausted_source = True
                 break
             raw_records.extend(page)
             if len(page) < remaining:
+                exhausted_source = True
                 break
             offset += len(page)
     finally:
         if own_session:
             client.close()
 
+    has_more = (not exhausted_source) and len(raw_records) > 0
     bronze_records = [
         soda_record_to_bronze_dict(
             row,
@@ -382,19 +466,38 @@ def fetch_soda_incremental(
             latest_updated_on = formatted_updated
             latest_id = row_id
 
+    prior_cumulative = (
+        int(prior_watermark.cumulative_records_fetched)
+        if prior_watermark is not None
+        else 0
+    )
+    lag_seconds = compute_ingestion_lag_seconds(
+        latest_updated_on,
+        now_utc=ingested_at.replace(tzinfo=UTC),
+    )
+    backlog_detected = bool(has_more)
+
     next_watermark = SodaWatermark(
         last_updated_on=latest_updated_on,
         last_id=latest_id,
         records_fetched=len(bronze_records),
+        cumulative_records_fetched=prior_cumulative + len(bronze_records),
         last_batch_id=run_batch_id,
         updated_at_utc=ingested_at.replace(tzinfo=UTC).isoformat(),
+        has_more=has_more,
+        backlog_detected=backlog_detected,
+        ingestion_lag_seconds=lag_seconds,
     )
     logger.info(
-        "Fetched %d incremental SODA rows across %d page(s) (where=%s next_updated_on=%s)",
+        "Fetched %d incremental SODA rows across %d page(s) "
+        "(where=%s next_updated_on=%s last_id=%s has_more=%s lag_s=%s)",
         len(bronze_records),
         pages_fetched,
         effective_where,
         next_watermark.last_updated_on,
+        next_watermark.last_id,
+        has_more,
+        lag_seconds,
     )
     return SodaFetchResult(
         records=bronze_records,
@@ -404,4 +507,8 @@ def fetch_soda_incremental(
         effective_where=effective_where,
         pages_fetched=pages_fetched,
         raw_count=len(raw_records),
+        skipped_committed_count=0,
+        has_more=has_more,
+        backlog_detected=backlog_detected,
+        ingestion_lag_seconds=lag_seconds,
     )

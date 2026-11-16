@@ -311,13 +311,36 @@ def _project_silver_schema(candidate_df: DataFrame) -> DataFrame:
 
 
 def _rank_by_id(projected_df: DataFrame) -> DataFrame:
-    """Rank valid candidates per `ID` deterministically by newest `Updated On`."""
-    order_cols: list[Column] = [F.col("Updated On").desc_nulls_last()]
+    """Rank valid candidates per `ID` deterministically by newest `Updated On`.
+
+    Tie-breaking order aligns with Silver Delta MERGE (`storage.delta`):
+    1. `Updated On` descending (`NULLS LAST`).
+    2. Deterministic SHA-256 digest over canonical business payload columns descending.
+    3. `ingestion_timestamp` descending (`NULLS LAST`) and `source_id` ascending when present.
+    """
+    excluded = {
+        "ID",
+        "Updated On",
+        "ingestion_timestamp",
+        "ingestion_batch_id",
+        "source_id",
+    }
+    business_cols = sorted(col for col in projected_df.columns if col not in excluded)
+    payload_digest = F.sha2(
+        F.concat_ws(
+            "||",
+            *[
+                F.coalesce(F.col(f"`{col}`").cast("string"), F.lit("<NULL>"))
+                for col in business_cols
+            ],
+        ),
+        256,
+    )
+    order_cols: list[Column] = [F.col("Updated On").desc_nulls_last(), payload_digest.desc()]
     if "ingestion_timestamp" in projected_df.columns:
         order_cols.append(F.col("ingestion_timestamp").desc_nulls_last())
     if "source_id" in projected_df.columns:
         order_cols.append(F.col("source_id").asc_nulls_last())
-    order_cols.extend([F.col("Date").desc_nulls_last(), F.col("Primary Type").asc_nulls_last()])
 
     win = Window.partitionBy("ID").orderBy(*order_cols)
     return projected_df.withColumn("_dedup_rank", F.row_number().over(win))

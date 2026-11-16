@@ -507,3 +507,169 @@ def test_silver_compatible_with_analytics_and_experiments(
     )
     assert Path(samp_res["Arrest"]["oversampling"]["report_path"]).is_file()
     assert Path(samp_res["Domestic"]["undersampling"]["pca_after_path"]).is_file()
+
+
+def test_chicago_timestamp_semantics_dst_and_batch_soda_consistency(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    """Verify CST/CDT offsets, midnight boundaries, DST gap/fold, and CSV vs SODA parity."""
+    from chicago_crimes.ingestion.soda_client import soda_record_to_bronze_dict
+    from chicago_crimes.processing.gold import compute_gold_dataframes
+    from chicago_crimes.streaming.crime_stream import KAFKA_JSON_SCHEMA
+
+    csv_path = _write_raw_semicolon_lines(
+        [
+            # 1. Winter CST (UTC-6) late-night timestamp: stays on 2024-01-15 in Chicago local time,
+            #    while ts_utc advances to 2024-01-16 05:30:00Z.
+            _make_raw_row(
+                cid="7001",
+                date_str="01/15/2024 11:30:00 PM",
+                year="2024",
+                updated_on="01/16/2024 01:00:00 AM",
+            ),
+            # 2. Summer CDT (UTC-5) late-night timestamp: stays on 2024-07-15 in Chicago local time,
+            #    while ts_utc advances to 2024-07-16 04:30:00Z.
+            _make_raw_row(
+                cid="7002",
+                date_str="07/15/2024 11:30:00 PM",
+                year="2024",
+                updated_on="07/16/2024 01:00:00 AM",
+            ),
+            # 3. Midnight & New Year calendar boundary (2001-01-01 00:00:00 CST):
+            #    must stay 2001-01-01 (never shift into 2000-12-31!), ts_utc = 2001-01-01 06:00:00Z.
+            _make_raw_row(
+                cid="7003",
+                date_str="01/01/2001 12:00:00 AM",
+                year="2001",
+                updated_on="01/02/2001 08:00:00 AM",
+            ),
+            # 4. DST spring-forward nonexistent local hour (2024-03-10 02:30:00 AM):
+            #    preserve local wall-clock 02:30:00, flag dst_spring_gap_nonexistent, ts_utc = NULL.
+            _make_raw_row(
+                cid="7004",
+                date_str="03/10/2024 02:30:00 AM",
+                year="2024",
+                updated_on="03/10/2024 09:00:00 AM",
+            ),
+            # 5. DST fall-back ambiguous local hour (2024-11-03 01:30:00 AM):
+            #    preserve local wall-clock 01:30:00, flag dst_fall_fold_ambiguous, ts_utc = NULL.
+            _make_raw_row(
+                cid="7005",
+                date_str="11/03/2024 01:30:00 AM",
+                year="2024",
+                updated_on="11/03/2024 09:00:00 AM",
+            ),
+        ],
+        tmp_path / "chicago_timestamps.csv",
+    )
+    raw_df = load_raw_csv_for_bronze(spark, csv_path)
+    silver_res = run_silver_pipeline(raw_df)
+    rows = {
+        r["ID"]: r
+        for r in silver_res.silver_df.select(
+            "ID",
+            F.date_format("Date", "yyyy-MM-dd HH:mm:ss").alias("date_str"),
+            F.date_format("ts", "yyyy-MM-dd HH:mm:ss").alias("ts_str"),
+            F.date_format("ts_utc", "yyyy-MM-dd HH:mm:ss").alias("ts_utc_str"),
+            "timestamp_dst_flag",
+            "year",
+            "month",
+            "hour",
+            "day_of_week",
+        ).collect()
+    }
+
+    # 1. Winter CST (UTC-6)
+    assert rows[7001]["date_str"] == "2024-01-15 23:30:00"
+    assert rows[7001]["ts_utc_str"] == "2024-01-16 05:30:00"
+    assert rows[7001]["timestamp_dst_flag"] == "valid_cst"
+    assert rows[7001]["year"] == 2024 and rows[7001]["month"] == 1 and rows[7001]["hour"] == 23
+
+    # 2. Summer CDT (UTC-5)
+    assert rows[7002]["date_str"] == "2024-07-15 23:30:00"
+    assert rows[7002]["ts_utc_str"] == "2024-07-16 04:30:00"
+    assert rows[7002]["timestamp_dst_flag"] == "valid_cdt"
+    assert rows[7002]["year"] == 2024 and rows[7002]["month"] == 7 and rows[7002]["hour"] == 23
+
+    # 3. Midnight boundary 2001-01-01 00:00:00 CST
+    assert rows[7003]["date_str"] == "2001-01-01 00:00:00"
+    assert rows[7003]["ts_utc_str"] == "2001-01-01 06:00:00"
+    assert rows[7003]["timestamp_dst_flag"] == "valid_cst"
+    assert rows[7003]["year"] == 2001 and rows[7003]["month"] == 1 and rows[7003]["hour"] == 0
+
+    # 4. DST spring transition nonexistent gap
+    assert rows[7004]["date_str"] == "2024-03-10 02:30:00"
+    assert rows[7004]["ts_utc_str"] is None
+    assert rows[7004]["timestamp_dst_flag"] == "dst_spring_gap_nonexistent"
+    assert rows[7004]["hour"] == 2
+
+    # 5. DST fall transition ambiguous fold
+    assert rows[7005]["date_str"] == "2024-11-03 01:30:00"
+    assert rows[7005]["ts_utc_str"] is None
+    assert rows[7005]["timestamp_dst_flag"] == "dst_fall_fold_ambiguous"
+    assert rows[7005]["hour"] == 1
+
+    # Gold daily & monthly aggregations keep 2001-01-01 in 2001-01 and 23:30 PM on local date
+    gold_dfs = compute_gold_dataframes(silver_res.silver_df, total_incidents=5)
+    daily_dates = {
+        str(r["crime_date"]) for r in gold_dfs["daily_citywide_counts"].collect()
+    }
+    assert daily_dates == {
+        "2001-01-01",
+        "2024-01-15",
+        "2024-03-10",
+        "2024-07-15",
+        "2024-11-03",
+    }
+    assert "2000-12-31" not in daily_dates
+
+    # 6. Historical batch CSV vs SODA API floating ISO timestamp consistency
+    soda_bronze = soda_record_to_bronze_dict(
+        {
+            "id": "7002",
+            "case_number": "HJ1001",
+            "date": "2024-07-15T23:30:00.000",
+            "block": "001XX N STATE ST",
+            "iucr": "0820",
+            "primary_type": "THEFT",
+            "description": "OVER $500",
+            "location_description": "STREET",
+            "arrest": False,
+            "domestic": False,
+            "beat": "111",
+            "district": "1",
+            "ward": "42",
+            "community_area": "32",
+            "fbi_code": "06",
+            "x_coordinate": "1176352",
+            "y_coordinate": "1900927",
+            "year": "2024",
+            "updated_on": "2024-07-16T01:00:00.000",
+            "latitude": "41.8835",
+            "longitude": "-87.6278",
+            "location": {"latitude": "41.8835", "longitude": "-87.6278"},
+        },
+        batch_id="soda-consistency",
+    )
+    soda_df = spark.createDataFrame([soda_bronze], schema=KAFKA_JSON_SCHEMA)
+    soda_silver = (
+        run_silver_pipeline(soda_df)
+        .silver_df.select(
+            F.date_format("Date", "yyyy-MM-dd HH:mm:ss").alias("date_str"),
+            F.date_format("ts_utc", "yyyy-MM-dd HH:mm:ss").alias("ts_utc_str"),
+            "timestamp_dst_flag",
+            "year",
+            "month",
+            "hour",
+            "day_of_week",
+        )
+        .first()
+    )
+    assert soda_silver is not None
+    assert soda_silver["date_str"] == rows[7002]["date_str"]
+    assert soda_silver["ts_utc_str"] == rows[7002]["ts_utc_str"]
+    assert soda_silver["timestamp_dst_flag"] == rows[7002]["timestamp_dst_flag"]
+    assert soda_silver["year"] == rows[7002]["year"]
+    assert soda_silver["month"] == rows[7002]["month"]
+    assert soda_silver["hour"] == rows[7002]["hour"]
+    assert soda_silver["day_of_week"] == rows[7002]["day_of_week"]
