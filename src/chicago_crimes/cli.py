@@ -357,6 +357,8 @@ def _handle_ingest_soda(args: argparse.Namespace, cfg: AppConfig) -> int:
         since=args.since,
         until=args.until,
         max_records=args.limit,
+        page_size=args.page_size,
+        max_pages=args.max_pages,
         default_lookback_hours=args.lookback_hours,
         publish_kafka=args.publish_kafka,
         commit_watermark=not args.no_commit_watermark,
@@ -730,6 +732,18 @@ def build_parser() -> argparse.ArgumentParser:
     soda_p.add_argument("--since", default=None, help="Override start ISO timestamp.")
     soda_p.add_argument("--until", default=None, help="Optional upper bound ISO timestamp.")
     soda_p.add_argument("--limit", type=int, default=None, help="Maximum records to fetch.")
+    soda_p.add_argument(
+        "--page-size",
+        type=int,
+        default=None,
+        help="SODA page size per HTTP request (default from config: 1000).",
+    )
+    soda_p.add_argument(
+        "--max-pages",
+        type=int,
+        default=None,
+        help="Maximum SODA pages to fetch in one bounded catch-up run (default: 10).",
+    )
     soda_p.add_argument(
         "--lookback-hours",
         type=int,

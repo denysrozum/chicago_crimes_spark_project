@@ -78,6 +78,7 @@ class StreamingConfig(BaseModel):
     soda_endpoint: str = "https://data.cityofchicago.org/resource/ijzp-q8t2.json"
     soda_app_token: str | None = None
     soda_page_size: int = Field(default=1000, ge=1, le=50000)
+    soda_max_pages_per_run: int = Field(default=10, ge=1, le=500)
     soda_overlap_seconds: int = Field(default=60, ge=0)
     watermark_path: str = "artifacts/state/soda_watermark.json"
     kafka_bootstrap_servers: str = "localhost:9094"

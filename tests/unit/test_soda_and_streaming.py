@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -167,7 +168,11 @@ def test_soda_pagination_retry_and_missing_geo_mapping(tmp_path: Path) -> None:
     assert sleeps == [0.0]
     assert res.pages_fetched == 2
     assert len(res.records) == 3
-    assert "updated_on >= '2026-11-12T09:59:00.000'" == res.effective_where
+    expected_where = (
+        "updated_on >= '2026-11-12T09:59:00.000' "
+        "AND (updated_on != '2026-11-12T10:00:00.000' OR id > '9000')"
+    )
+    assert expected_where == res.effective_where
     assert fake_session.calls[0]["headers"]["X-App-Token"] == "test-token"
     assert fake_session.calls[1]["params"]["$offset"] == 0
     assert fake_session.calls[2]["params"]["$offset"] == 2
@@ -215,6 +220,9 @@ def test_watermark_not_advanced_on_kafka_publish_failure(
         batch_id = "b1"
         effective_where = "updated_on >= '2026-11-12T09:59:00.000'"
         pages_fetched = 1
+        has_more = False
+        backlog_detected = False
+        ingestion_lag_seconds = 12.0
 
     monkeypatch.setattr(
         "chicago_crimes.ingestion.kafka_producer.fetch_soda_incremental",
@@ -480,6 +488,236 @@ def test_microbatch_crash_replay_is_idempotent_across_all_sinks(
 
     lines = [ln for ln in metrics_log.read_text(encoding="utf-8").splitlines() if ln.strip()]
     assert len(lines) == 1
+
+
+def test_microbatch_crash_recovery_never_reverts_newer_silver_record(
+    spark: SparkSession, tmp_path: Path
+) -> None:
+    """Crash recovery replaying a stale or null-timestamp batch must never revert Silver data."""
+    bronze_dir = tmp_path / "bronze_crash"
+    silver_dir = tmp_path / "silver_crash"
+    quarantine_dir = tmp_path / "quarantine_crash"
+    dlq_dir = tmp_path / "dlq_crash"
+    metrics_log = tmp_path / "metrics_crash.jsonl"
+    schema = "value BINARY, topic STRING, partition INT, offset LONG, timestamp STRING"
+
+    rec_v2_new = soda_record_to_bronze_dict(
+        {
+            "id": "555",
+            "case_number": "JK0555",
+            "date": "2026-11-12T10:00:00.000",
+            "block": "001XX N STATE ST",
+            "iucr": "0890",
+            "primary_type": "THEFT",
+            "description": "CONFIRMED_NEWEST",
+            "location_description": "STREET",
+            "arrest": True,
+            "domestic": False,
+            "beat": "0111",
+            "district": "001",
+            "ward": "42",
+            "community_area": "32",
+            "fbi_code": "06",
+            "year": "2026",
+            "updated_on": "2026-11-12T18:00:00.000",
+        },
+        batch_id="b-new",
+    )
+    df_new = spark.createDataFrame(
+        [_kafka_row(json.dumps(rec_v2_new), offset=100)], schema=schema
+    )
+    process_kafka_microbatch(
+        df_new,
+        batch_id=1,
+        bronze_target=bronze_dir,
+        silver_target=silver_dir,
+        quarantine_target=quarantine_dir,
+        dlq_target=dlq_dir,
+        table_format="delta",
+        metrics_log_path=metrics_log,
+    )
+
+    # Simulate a delayed/replayed batch containing both an older timestamp and a null timestamp
+    # that crashes mid-flight after Bronze write and is then re-executed on recovery.
+    rec_v1_old = {
+        **rec_v2_new,
+        "Description": "STALE_OLDER_VERSION",
+        "Arrest": "false",
+        "Updated On": "2026-11-12T09:00:00.000",
+    }
+    rec_null_ts = {
+        **rec_v2_new,
+        "Description": "NULL_TIMESTAMP_VERSION",
+        "Arrest": "false",
+        "Updated On": None,
+    }
+    df_stale_and_null = spark.createDataFrame(
+        [
+            _kafka_row(json.dumps(rec_v1_old), offset=101),
+            _kafka_row(json.dumps(rec_null_ts), offset=102),
+        ],
+        schema=schema,
+    )
+
+    def _crash_after_bronze(stage: str, bid: int) -> None:
+        if stage == "after_bronze":
+            raise RuntimeError(f"Crash after bronze in batch {bid}")
+
+    with pytest.raises(RuntimeError, match="Crash after bronze"):
+        process_kafka_microbatch(
+            df_stale_and_null,
+            batch_id=2,
+            bronze_target=bronze_dir,
+            silver_target=silver_dir,
+            quarantine_target=quarantine_dir,
+            dlq_target=dlq_dir,
+            table_format="delta",
+            metrics_log_path=metrics_log,
+            on_stage=_crash_after_bronze,
+        )
+
+    # Recovery replay of batch 2 completes cleanly without reverting ID=555 in Silver
+    stats_recovered = process_kafka_microbatch(
+        df_stale_and_null,
+        batch_id=2,
+        bronze_target=bronze_dir,
+        silver_target=silver_dir,
+        quarantine_target=quarantine_dir,
+        dlq_target=dlq_dir,
+        table_format="delta",
+        metrics_log_path=metrics_log,
+    )
+    assert stats_recovered.is_reconciled is True
+    row_555 = (
+        read_table(spark, silver_dir, table_format="delta")
+        .filter("ID = 555")
+        .first()
+    )
+    assert row_555 is not None
+    assert row_555["Description"] == "CONFIRMED_NEWEST"
+    assert row_555["Arrest"] is True
+
+
+def test_soda_consecutive_polls_catchup_and_identical_timestamps(tmp_path: Path) -> None:
+    """Consecutive polls with >100 pending rows and identical `updated_on` never skip or stall."""
+    wm_path = tmp_path / "wm_catchup.json"
+    # 250 pending records: first 180 share the EXACT SAME updated_on timestamp,
+    # next 70 share a second timestamp.
+    all_rows = [
+        {
+            "id": f"{10000 + i}",
+            "case_number": f"JK{10000 + i}",
+            "date": "2026-11-10T12:00:00.000",
+            "primary_type": "THEFT",
+            "description": f"ITEM_{i}",
+            "arrest": False,
+            "domestic": False,
+            "year": "2026",
+            "updated_on": (
+                "2026-11-10T15:41:56.000" if i < 180 else "2026-11-10T15:45:00.000"
+            ),
+        }
+        for i in range(250)
+    ]
+
+    # Poll 1: limit=100, page_size=50 -> fetches 2 pages (rows 0..99),
+    # detects has_more=True & backlog_detected=True.
+    sess1 = _FakeSession(
+        [
+            _FakeResponse(200, all_rows[0:50]),
+            _FakeResponse(200, all_rows[50:100]),
+        ]
+    )
+    res1 = fetch_soda_incremental(
+        watermark_path=wm_path,
+        since="2026-11-10T15:00:00.000",
+        page_size=50,
+        max_records=100,
+        overlap_seconds=60,
+        session=sess1,  # type: ignore[arg-type]
+        now_utc=datetime(2026, 11, 10, 22, 0, 0),
+    )
+    assert len(res1.records) == 100
+    assert res1.pages_fetched == 2
+    assert res1.has_more is True
+    assert res1.backlog_detected is True
+    assert res1.ingestion_lag_seconds is not None and res1.ingestion_lag_seconds > 0
+    assert res1.next_watermark.last_updated_on == "2026-11-10T15:41:56.000"
+    assert res1.next_watermark.last_id == "10099"
+    save_watermark(wm_path, res1.next_watermark)
+
+    # Poll 2: resumes from saved watermark (has_more=True) with limit=100 ->
+    # must use strict composite cursor and fetch rows 100..199 without starvation!
+    sess2 = _FakeSession(
+        [
+            _FakeResponse(200, all_rows[100:150]),
+            _FakeResponse(200, all_rows[150:200]),
+        ]
+    )
+    res2 = fetch_soda_incremental(
+        watermark_path=wm_path,
+        page_size=50,
+        max_records=100,
+        overlap_seconds=60,
+        session=sess2,  # type: ignore[arg-type]
+        now_utc=datetime(2026, 11, 10, 22, 5, 0),
+    )
+    expected_poll2_where = (
+        "(updated_on > '2026-11-10T15:41:56.000' "
+        "OR (updated_on = '2026-11-10T15:41:56.000' AND id > '10099'))"
+    )
+    assert res2.effective_where == expected_poll2_where
+    assert len(res2.records) == 100
+    assert res2.has_more is True
+    assert res2.next_watermark.last_updated_on == "2026-11-10T15:45:00.000"
+    assert res2.next_watermark.last_id == "10199"
+    assert res2.next_watermark.cumulative_records_fetched == 200
+    save_watermark(wm_path, res2.next_watermark)
+
+    # Poll 3: fetches remaining 50 rows (200..249) and sees empty 2nd page ->
+    # has_more=False, backlog drained!
+    sess3 = _FakeSession(
+        [
+            _FakeResponse(200, all_rows[200:250]),
+            _FakeResponse(200, []),
+        ]
+    )
+    res3 = fetch_soda_incremental(
+        watermark_path=wm_path,
+        page_size=50,
+        max_records=100,
+        overlap_seconds=60,
+        session=sess3,  # type: ignore[arg-type]
+        now_utc=datetime(2026, 11, 10, 22, 10, 0),
+    )
+    assert len(res3.records) == 50
+    assert res3.has_more is False
+    assert res3.backlog_detected is False
+    assert res3.next_watermark.last_id == "10249"
+    assert res3.next_watermark.cumulative_records_fetched == 250
+    save_watermark(wm_path, res3.next_watermark)
+
+    fetched_ids = [r["ID"] for r in (*res1.records, *res2.records, *res3.records)]
+    assert fetched_ids == [f"{10000 + i}" for i in range(250)]
+
+    # Poll 4 (after full drain, has_more=False, overlap_seconds=60):
+    # Applies 60-second overlap window while excluding `<= last_id` at `last_updated_on`!
+    sess4 = _FakeSession([_FakeResponse(200, [])])
+    res4 = fetch_soda_incremental(
+        watermark_path=wm_path,
+        page_size=50,
+        max_records=100,
+        overlap_seconds=60,
+        session=sess4,  # type: ignore[arg-type]
+        now_utc=datetime(2026, 11, 10, 22, 15, 0),
+    )
+    expected_poll4_where = (
+        "updated_on >= '2026-11-10T15:44:00.000' "
+        "AND (updated_on != '2026-11-10T15:45:00.000' OR id > '10249')"
+    )
+    assert res4.effective_where == expected_poll4_where
+    assert len(res4.records) == 0
+    assert res4.has_more is False
 
 
 def test_merge_insert_only_delta_backfills_legacy_schema(
